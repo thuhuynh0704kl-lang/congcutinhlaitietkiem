@@ -1,277 +1,433 @@
+
 import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+import tensorflow as tf
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Input
+from tensorflow.keras.callbacks import EarlyStopping
 
 # =========================
-# CẤU HÌNH TRANG
+# 1. CẤU HÌNH ỨNG DỤNG
 # =========================
 st.set_page_config(
-    page_title="Tính lãi tiền gửi tiết kiệm",
-    page_icon="💰",
-    layout="centered"
+    page_title="Dự báo giá cổ phiếu VNM",
+    page_icon="📈",
+    layout="wide"
 )
 
-# =========================
-# CSS GIAO DIỆN
-# =========================
-st.markdown("""
-<style>
-    .main-title {
-        text-align: center;
-        font-size: 32px;
-        font-weight: bold;
-        margin-bottom: 5px;
-    }
+st.title("📈 DỰ BÁO GIÁ CỔ PHIẾU BẰNG LSTM")
+st.write("Dự báo giá đóng cửa cổ phiếu bằng mô hình Deep Learning.")
 
-    .sub-title {
-        text-align: center;
-        color: #666;
-        margin-bottom: 25px;
-    }
+# Cố định seed
+seed = 42
+np.random.seed(seed)
+tf.random.set_seed(seed)
+random.seed(seed)
 
-    .result-box {
-        padding: 18px;
-        border-radius: 12px;
-        border: 1px solid #ddd;
-        margin-bottom: 12px;
-    }
-
-    .result-label {
-        font-size: 15px;
-        color: #666;
-    }
-
-    .result-value {
-        font-size: 23px;
-        font-weight: bold;
-    }
-</style>
-""", unsafe_allow_html=True)
 
 # =========================
-# TIÊU ĐỀ
+# 2. HÀM TẠO CHUỖI DỮ LIỆU
 # =========================
-st.markdown(
-    '<div class="main-title">💰 TÍNH LÃI TIỀN GỬI TIẾT KIỆM</div>',
-    unsafe_allow_html=True
+def create_sequences(data, window_size=60):
+    X, y = [], []
+
+    for i in range(window_size, len(data)):
+        X.append(data[i - window_size:i])
+        y.append(data[i])
+
+    return np.array(X), np.array(y)
+
+
+# =========================
+# 3. THANH CÀI ĐẶT
+# =========================
+st.sidebar.header("Cài đặt mô hình")
+
+ticker = st.sidebar.text_input(
+    "Mã cổ phiếu Yahoo Finance",
+    value="VNM.VN"
+).strip().upper()
+
+start_date = st.sidebar.date_input(
+    "Ngày bắt đầu",
+    value=pd.to_datetime("2018-01-01").date()
 )
 
-st.markdown(
-    '<div class="sub-title">Tính lãi đơn và lãi kép theo kỳ hạn gửi</div>',
-    unsafe_allow_html=True
+end_date = st.sidebar.date_input(
+    "Ngày kết thúc",
+    value=pd.Timestamp.today().date()
 )
 
-# =========================
-# NHẬP THÔNG TIN
-# =========================
-st.subheader("📋 Thông tin tiền gửi")
-
-so_tien = st.number_input(
-    "Số tiền gửi (VNĐ)",
-    min_value=0.0,
-    value=100_000_000.0,
-    step=1_000_000.0,
-    format="%.0f"
+window_size = st.sidebar.number_input(
+    "Số phiên nhìn lại",
+    min_value=10,
+    max_value=180,
+    value=60
 )
 
-ky_han = st.number_input(
-    "Kỳ hạn (tháng)",
+epochs = st.sidebar.number_input(
+    "Số epochs",
     min_value=1,
-    max_value=600,
-    value=12,
-    step=1
+    max_value=100,
+    value=10
 )
 
-loai_lai = st.selectbox(
-    "Hình thức tính lãi",
-    [
-        "Lãi đơn",
-        "Lãi kép"
-    ]
+forecast_days = st.sidebar.number_input(
+    "Số phiên muốn dự báo",
+    min_value=1,
+    max_value=30,
+    value=10
 )
 
-hinh_thuc_nhan_lai = st.selectbox(
-    "Hình thức nhận lãi",
-    [
-        "Lãnh lãi hàng tháng",
-        "Lãnh lãi hàng quý",
-        "Lãnh lãi cuối kỳ"
-    ]
+run_button = st.sidebar.button(
+    "Chạy mô hình",
+    type="primary"
 )
 
-lai_suat_nam = st.number_input(
-    "Lãi suất (%/năm)",
-    min_value=0.0,
-    max_value=100.0,
-    value=6.0,
-    step=0.01,
-    format="%.2f"
-)
 
 # =========================
-# NÚT TÍNH
+# 4. TẢI DỮ LIỆU
 # =========================
-if st.button("🧮 TÍNH LÃI", use_container_width=True):
+if run_button:
 
-    # Kiểm tra dữ liệu
-    if so_tien <= 0:
-        st.error("Vui lòng nhập số tiền gửi lớn hơn 0.")
+    if not ticker:
+        st.error("Vui lòng nhập mã cổ phiếu.")
         st.stop()
 
-    if lai_suat_nam < 0:
-        st.error("Lãi suất không được nhỏ hơn 0.")
+    if start_date >= end_date:
+        st.error("Ngày bắt đầu phải trước ngày kết thúc.")
         st.stop()
 
-    # Đổi lãi suất từ % sang số thập phân
-    r = lai_suat_nam / 100
+    with st.spinner("Đang tải dữ liệu..."):
 
-    # Kỳ hạn tính theo năm
-    so_nam = ky_han / 12
+        try:
+            df = yf.download(
+                ticker,
+                start=start_date.strftime("%Y-%m-%d"),
+                end=(end_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                auto_adjust=False,
+                progress=False
+            )
 
-    # =========================
-    # LÃI ĐƠN
-    # =========================
-    if loai_lai == "Lãi đơn":
+            if df.empty:
+                st.error("Không tải được dữ liệu. Hãy kiểm tra mã cổ phiếu.")
+                st.stop()
 
-        # I = P × r × t
-        tong_lai = so_tien * r * so_nam
+            # Xử lý cột MultiIndex của yfinance
+            if isinstance(df.columns, pd.MultiIndex):
+                close_columns = [
+                    col for col in df.columns
+                    if col[0] == "Close"
+                ]
 
-        tong_tien = so_tien + tong_lai
+                if not close_columns:
+                    st.error("Không tìm thấy cột giá đóng cửa.")
+                    st.stop()
 
-        # Tính lãi theo kỳ nhận
-        if hinh_thuc_nhan_lai == "Lãnh lãi hàng tháng":
-            tien_lai_dinh_ky = so_tien * r / 12
+                close = df[close_columns[0]]
 
-        elif hinh_thuc_nhan_lai == "Lãnh lãi hàng quý":
-            tien_lai_dinh_ky = so_tien * r / 4
+            else:
+                close = df["Close"]
 
-        else:
-            tien_lai_dinh_ky = tong_lai
+            data = pd.DataFrame({
+                "Close": pd.to_numeric(close, errors="coerce")
+            }).dropna()
 
-    # =========================
-    # LÃI KÉP
-    # =========================
-    else:
+        except Exception as e:
+            st.error(f"Lỗi tải dữ liệu: {e}")
+            st.stop()
 
-        if hinh_thuc_nhan_lai == "Lãnh lãi hàng tháng":
+    if len(data) <= int(window_size) + 20:
+        st.error("Dữ liệu không đủ để huấn luyện mô hình.")
+        st.stop()
 
-            # Lãi kép theo tháng
-            so_ky = ky_han
-            lai_suat_ky = r / 12
+    st.subheader("1. Dữ liệu lịch sử")
 
-            tong_tien = so_tien * (1 + lai_suat_ky) ** so_ky
-            tong_lai = tong_tien - so_tien
+    col1, col2, col3 = st.columns(3)
 
-            # Lãi phát sinh trong tháng đầu tiên
-            tien_lai_dinh_ky = so_tien * lai_suat_ky
+    col1.metric("Số phiên giao dịch", len(data))
+    col2.metric("Giá đóng cửa gần nhất", f"{data['Close'].iloc[-1]:,.2f}")
+    col3.metric("Mã cổ phiếu", ticker)
 
-        elif hinh_thuc_nhan_lai == "Lãnh lãi hàng quý":
-
-            # Lãi kép theo quý
-            so_ky = ky_han / 3
-            lai_suat_ky = r / 4
-
-            tong_tien = so_tien * (1 + lai_suat_ky) ** so_ky
-            tong_lai = tong_tien - so_tien
-
-            # Lãi phát sinh trong quý đầu tiên
-            tien_lai_dinh_ky = so_tien * lai_suat_ky
-
-        else:
-
-            # Lãi kép cuối kỳ
-            # Tính theo kỳ hạn tháng, ghép lãi hàng tháng
-            so_ky = ky_han
-            lai_suat_ky = r / 12
-
-            tong_tien = so_tien * (1 + lai_suat_ky) ** so_ky
-            tong_lai = tong_tien - so_tien
-
-            tien_lai_dinh_ky = tong_lai
+    st.line_chart(data["Close"])
 
     # =========================
-    # HIỂN THỊ KẾT QUẢ
+    # 5. CHIA TẬP TRAIN VÀ TEST
     # =========================
-    st.divider()
-    st.subheader("📊 Kết quả")
+    values = data[["Close"]].values
 
-    col1, col2 = st.columns(2)
+    train_size = int(0.8 * len(values))
 
-    with col1:
-        st.metric(
-            "💵 Tiền lãi định kỳ",
-            f"{tien_lai_dinh_ky:,.0f} VNĐ"
+    train_data = values[:train_size]
+    test_data = values[train_size:]
+
+    scaler = MinMaxScaler()
+
+    train_scaled = scaler.fit_transform(train_data)
+    test_scaled = scaler.transform(test_data)
+
+    X_train, y_train = create_sequences(
+        train_scaled, int(window_size)
+    )
+
+    test_combined = np.vstack([
+        train_scaled[-int(window_size):],
+        test_scaled
+    ])
+
+    X_test, y_test = create_sequences(
+        test_combined, int(window_size)
+    )
+
+    # Tách validation theo thứ tự thời gian
+    val_size = max(1, int(0.1 * len(X_train)))
+
+    X_val = X_train[-val_size:]
+    y_val = y_train[-val_size:]
+
+    X_train_final = X_train[:-val_size]
+    y_train_final = y_train[:-val_size]
+
+    if len(X_train_final) == 0:
+        st.error("Không đủ dữ liệu để tạo tập huấn luyện.")
+        st.stop()
+
+    # =========================
+    # 6. XÂY DỰNG MÔ HÌNH LSTM
+    # =========================
+    model = Sequential([
+        Input(shape=(int(window_size), 1)),
+        LSTM(50, return_sequences=True),
+        LSTM(50),
+        Dense(1)
+    ])
+
+    model.compile(
+        optimizer="adam",
+        loss="mean_squared_error"
+    )
+
+    early_stop = EarlyStopping(
+        monitor="val_loss",
+        patience=5,
+        restore_best_weights=True
+    )
+
+    st.subheader("2. Huấn luyện mô hình")
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    class StreamlitProgress(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            progress.progress(
+                min(1.0, (epoch + 1) / int(epochs))
+            )
+            status.write(
+                f"Epoch {epoch + 1}/{int(epochs)}"
+                f" | Loss: {logs.get('loss', 0):.6f}"
+                f" | Val Loss: {logs.get('val_loss', 0):.6f}"
+            )
+
+    with st.spinner("Mô hình đang học từ dữ liệu..."):
+
+        history = model.fit(
+            X_train_final,
+            y_train_final,
+            validation_data=(X_val, y_val),
+            epochs=int(epochs),
+            batch_size=32,
+            shuffle=False,
+            callbacks=[
+                early_stop,
+                StreamlitProgress()
+            ],
+            verbose=0
         )
 
-    with col2:
-        st.metric(
-            "📈 Tổng tiền lãi",
-            f"{tong_lai:,.0f} VNĐ"
-        )
+    st.success("Huấn luyện hoàn tất!")
 
-    st.metric(
-        "💰 Tổng tiền gốc + lãi",
-        f"{tong_tien:,.0f} VNĐ"
+    # =========================
+    # 7. ĐÁNH GIÁ MÔ HÌNH
+    # =========================
+    test_pred_scaled = model.predict(X_test, verbose=0)
+
+    test_pred = scaler.inverse_transform(test_pred_scaled)
+
+    y_test_real = scaler.inverse_transform(
+        y_test.reshape(-1, 1)
+    )
+
+    rmse = np.sqrt(
+        mean_squared_error(y_test_real, test_pred)
+    )
+
+    mae = mean_absolute_error(
+        y_test_real, test_pred
+    )
+
+    r2 = r2_score(y_test_real, test_pred)
+
+    st.subheader("3. Đánh giá mô hình")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("RMSE", f"{rmse:.3f}")
+    col2.metric("MAE", f"{mae:.3f}")
+    col3.metric("R²", f"{r2:.4f}")
+
+    st.caption(
+        "RMSE và MAE đo sai số dự báo; giá trị thấp thường tốt hơn. "
+        "R² càng gần 1 thường cho thấy mô hình phù hợp hơn trên tập đánh giá."
     )
 
     # =========================
-    # THÔNG TIN TÓM TẮT
+    # 8. BIỂU ĐỒ LOSS
     # =========================
-    st.divider()
+    st.subheader("4. Biểu đồ Train Loss và Validation Loss")
 
-    st.subheader("📝 Thông tin khoản gửi")
+    fig, ax = plt.subplots(figsize=(10, 4))
 
-    st.write(f"**Số tiền gửi:** {so_tien:,.0f} VNĐ")
-    st.write(f"**Kỳ hạn:** {ky_han} tháng ({so_nam:.2f} năm)")
-    st.write(f"**Hình thức tính:** {loai_lai}")
-    st.write(f"**Nhận lãi:** {hinh_thuc_nhan_lai}")
-    st.write(f"**Lãi suất:** {lai_suat_nam:.2f}%/năm")
+    ax.plot(history.history["loss"], label="Train Loss")
+    ax.plot(history.history["val_loss"], label="Validation Loss")
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("MSE")
+    ax.set_title("Loss Train vs Validation")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    st.pyplot(fig)
+    plt.close(fig)
 
     # =========================
-    # CÔNG THỨC
+    # 9. SO SÁNH GIÁ THẬT VÀ DỰ BÁO
     # =========================
-    with st.expander("📚 Xem công thức tính"):
+    st.subheader("5. Giá thực tế và giá dự báo trên tập Test")
 
-        if loai_lai == "Lãi đơn":
-            st.markdown("""
-            **Công thức lãi đơn:**
+    test_dates = data.index[train_size:]
 
-            `I = P × r × t`
+    comparison = pd.DataFrame(
+        {
+            "Giá thật": y_test_real.flatten(),
+            "Giá dự báo": test_pred.flatten()
+        },
+        index=test_dates
+    )
 
-            Trong đó:
+    st.line_chart(comparison)
 
-            - `P`: Số tiền gốc
-            - `r`: Lãi suất/năm
-            - `t`: Thời gian gửi (năm)
-            - `I`: Tổng tiền lãi
+    with st.expander("Xem bảng kết quả Test"):
+        st.dataframe(comparison, use_container_width=True)
 
-            **Tổng tiền nhận được:**
+    # =========================
+    # 10. DỰ BÁO TƯƠNG LAI
+    # =========================
+    st.subheader(
+        f"6. Dự báo {int(forecast_days)} phiên tiếp theo"
+    )
 
-            `A = P + I`
-            """)
+    all_scaled = scaler.transform(values)
 
-        else:
-            st.markdown("""
-            **Công thức lãi kép:**
+    last_window = all_scaled[-int(window_size):].reshape(
+        1, int(window_size), 1
+    )
 
-            `A = P × (1 + r)ⁿ`
+    future_predictions = []
 
-            Trong đó:
+    for _ in range(int(forecast_days)):
 
-            - `P`: Số tiền gốc
-            - `r`: Lãi suất mỗi kỳ
-            - `n`: Số kỳ ghép lãi
-            - `A`: Tổng tiền gốc + lãi
+        next_pred = model.predict(
+            last_window, verbose=0
+        )
 
-            **Tổng tiền lãi:**
+        future_predictions.append(next_pred[0, 0])
 
-            `I = A - P`
-            """)
+        last_window = np.concatenate(
+            [
+                last_window[:, 1:, :],
+                next_pred.reshape(1, 1, 1)
+            ],
+            axis=1
+        )
 
-# =========================
-# FOOTER
-# =========================
-st.divider()
+    future_predictions = scaler.inverse_transform(
+        np.array(future_predictions).reshape(-1, 1)
+    ).flatten()
 
-st.caption(
-    "💡 Lưu ý: Đây là công cụ tính toán mang tính tham khảo. "
-    "Lãi suất thực tế của ngân hàng có thể áp dụng quy định và cách tính khác."
-)
+    future_dates = pd.bdate_range(
+        start=data.index[-1] + pd.Timedelta(days=1),
+        periods=int(forecast_days)
+    )
+
+    future_df = pd.DataFrame({
+        "Ngày dự kiến": future_dates.strftime("%d/%m/%Y"),
+        "Giá đóng cửa dự báo": future_predictions
+    })
+
+    st.dataframe(future_df, use_container_width=True)
+
+    # =========================
+    # 11. BIỂU ĐỒ DỰ BÁO
+    # =========================
+    st.subheader("7. Biểu đồ dự báo tương lai")
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    recent_n = min(60, len(data))
+
+    ax.plot(
+        data.index[-recent_n:],
+        data["Close"].iloc[-recent_n:],
+        label="Giá lịch sử"
+    )
+
+    ax.plot(
+        future_dates,
+        future_predictions,
+        marker="o",
+        linestyle="--",
+        label="Giá dự báo"
+    )
+
+    ax.set_title(f"Dự báo giá cổ phiếu {ticker}")
+    ax.set_xlabel("Ngày")
+    ax.set_ylabel("Giá đóng cửa")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    fig.autofmt_xdate()
+
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # =========================
+    # 12. TẢI KẾT QUẢ
+    # =========================
+    csv = future_df.to_csv(index=False).encode("utf-8-sig")
+
+    st.download_button(
+        label="📥 Tải kết quả dự báo CSV",
+        data=csv,
+        file_name="du_bao_co_phieu.csv",
+        mime="text/csv"
+    )
+
+    st.warning(
+        "Dự báo chỉ dựa trên giá đóng cửa lịch sử. "
+        "Kết quả có thể sai lệch đáng kể và không phải "
+        "khuyến nghị mua hoặc bán cổ phiếu."
+    )
+
+else:
+    st.info(
+        "Nhập thông số ở thanh bên trái rồi nhấn "
+        "**Chạy mô hình** để bắt đầu."
+    )
